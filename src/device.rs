@@ -837,6 +837,17 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
         self.backend.poll_next_complete(cx)
     }
 
+    /// Take the original browser rejection for the most recently completed
+    /// transfer. Call immediately after `next_complete`/`poll_next_complete`
+    /// returns; the next completion replaces it, including on success.
+    ///
+    /// USB status failures (such as a stalled endpoint) and local validation
+    /// failures have no browser rejection and return `None`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn take_webusb_error(&mut self) -> Option<crate::WebUsbError> {
+        self.backend.take_webusb_error()
+    }
+
     /// Wait for a pending transfer completion.
     ///
     /// Blocks for up to `timeout` waiting for a transfer to complete, or

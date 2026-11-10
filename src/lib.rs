@@ -255,6 +255,8 @@ pub mod io;
 
 mod error;
 pub use error::{ActiveConfigurationError, Error, ErrorKind, GetDescriptorError};
+#[cfg(target_arch = "wasm32")]
+pub use error::WebUsbError;
 
 /// Get an iterator listing the connected devices.
 ///

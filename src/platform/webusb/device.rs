@@ -375,6 +375,7 @@ impl WebusbInterface {
             }),
             max_packet_size,
             pending: VecDeque::new(),
+            last_webusb_error: None,
         })
     }
 
@@ -418,6 +419,7 @@ enum Pending {
     Failed {
         buffer: Buffer,
         error: TransferError,
+        detail: Option<crate::WebUsbError>,
     },
 }
 
@@ -428,6 +430,9 @@ pub(crate) struct WebusbEndpoint {
 
     /// A queue of pending transfers, expected to complete in order.
     pending: VecDeque<Pending>,
+    // Replaced at every completion, so queued transfers cannot return stale
+    // evidence. Kept off TransferError to preserve its Copy contract.
+    last_webusb_error: Option<crate::WebUsbError>,
 }
 
 struct EndpointInner {
@@ -449,7 +454,7 @@ impl WebusbEndpoint {
     /// Used by the public `Endpoint::submit` to surface validation errors
     /// through the same completion queue as real transfers.
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
-        self.pending.push_back(Pending::Failed { buffer, error });
+        self.pending.push_back(Pending::Failed { buffer, error, detail: None });
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
@@ -472,7 +477,8 @@ impl WebusbEndpoint {
                         );
                         self.pending.push_back(Pending::Failed {
                             buffer,
-                            error: TransferError::Fault,
+                            error: js_value_to_transfer_error(e.clone()),
+                            detail: Some(super::rejection_details(&e)),
                         });
                         return;
                     }
@@ -498,9 +504,10 @@ impl WebusbEndpoint {
 
         match head {
             Pending::Failed { .. } => {
-                let Some(Pending::Failed { buffer, error }) = self.pending.pop_front() else {
+                let Some(Pending::Failed { buffer, error, detail }) = self.pending.pop_front() else {
                     unreachable!()
                 };
+                self.last_webusb_error = detail;
                 Poll::Ready(Completion {
                     buffer,
                     actual_len: 0,
@@ -509,6 +516,7 @@ impl WebusbEndpoint {
             }
             Pending::InFlight { future, .. } => {
                 let result = ready!(Pin::new(future).poll(cx));
+                self.last_webusb_error = result.as_ref().err().map(super::rejection_details);
                 let Some(Pending::InFlight {
                     buffer, direction, ..
                 }) = self.pending.pop_front()
@@ -518,6 +526,10 @@ impl WebusbEndpoint {
                 Poll::Ready(complete_transfer(buffer, direction, result))
             }
         }
+    }
+
+    pub(crate) fn take_webusb_error(&mut self) -> Option<crate::WebUsbError> {
+        self.last_webusb_error.take()
     }
 
     pub(crate) fn clear_halt(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
@@ -601,5 +613,69 @@ impl Drop for EndpointInner {
     fn drop(&mut self) {
         let mut state = self.interface.state.lock().unwrap();
         state.endpoints_used.clear(self.address);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn endpoint(script: &str) -> WebusbEndpoint {
+        let device = js_sys::eval(script).unwrap().unchecked_into();
+        let descriptor = [18, 1, 0, 2, 0, 0, 0, 64, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let device = Arc::new(WebusbDevice {
+            device,
+            device_descriptor: DeviceDescriptor::new(&descriptor).unwrap(),
+            config_descriptors: vec![],
+        });
+        let interface = Arc::new(WebusbInterface {
+            interface_number: 0,
+            released: true,
+            device,
+            state: Arc::new(Mutex::new(InterfaceState::default())),
+        });
+        WebusbEndpoint {
+            inner: Arc::new(EndpointInner { address: 1, interface }),
+            max_packet_size: 64,
+            pending: VecDeque::new(),
+            last_webusb_error: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn completion_retains_rejection_and_clears_it_on_next_completion() {
+        let mut endpoint = endpoint(r#"({
+            fail: true,
+            transferOut(_endpoint, data) {
+                if (this.fail) {
+                    this.fail = false;
+                    return Promise.reject({name:'SecurityError',message:'denied',stack:'original'});
+                }
+                return Promise.resolve({status:'ok',bytesWritten:data.byteLength});
+            }
+        })"#);
+        endpoint.submit(Buffer::from(vec![1]));
+        let result = std::future::poll_fn(|cx| endpoint.poll_next_complete(cx)).await;
+        assert!(result.status.is_err());
+        let detail = endpoint.take_webusb_error().unwrap();
+        assert_eq!((detail.name.as_str(), detail.message.as_str(), detail.stack.as_str()),
+            ("SecurityError", "denied", "original"));
+        assert!(endpoint.take_webusb_error().is_none());
+        endpoint.submit(Buffer::from(vec![2]));
+        let result = std::future::poll_fn(|cx| endpoint.poll_next_complete(cx)).await;
+        assert!(result.status.is_ok());
+        assert!(endpoint.take_webusb_error().is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn synchronous_submission_rejection_preserves_details() {
+        let mut endpoint = endpoint(r#"({
+            transferOut() { throw {name:'DataError',message:'too large',stack:'submit stack'}; }
+        })"#);
+        endpoint.submit(Buffer::from(vec![1]));
+        let result = std::future::poll_fn(|cx| endpoint.poll_next_complete(cx)).await;
+        assert!(result.status.is_err());
+        assert_eq!(endpoint.take_webusb_error().unwrap().stack, "submit stack");
     }
 }

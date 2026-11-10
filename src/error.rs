@@ -2,12 +2,26 @@ use std::{borrow::Cow, fmt::Display, io, num::NonZeroU32};
 
 use crate::{platform::format_os_error_code, transfer::TransferError};
 
+/// Owned browser rejection evidence, without retaining a thread-bound JS value.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebUsbError {
+    /// Browser exception name (or `WebUsbError` for an unstructured rejection).
+    pub name: String,
+    /// Browser message, or the string/debug representation of the rejection.
+    pub message: String,
+    /// Original browser stack, empty when the browser did not provide one.
+    pub stack: String,
+}
+
 /// Error returned from `nusb` operations other than transfers.
 #[derive(Debug, Clone)]
 pub struct Error {
     pub(crate) kind: ErrorKind,
     pub(crate) code: Option<NonZeroU32>,
     pub(crate) message: Cow<'static, str>,
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) webusb_error: Option<WebUsbError>,
 }
 
 impl Error {
@@ -16,6 +30,8 @@ impl Error {
             kind,
             code: None,
             message: message.into(),
+            #[cfg(target_arch = "wasm32")]
+            webusb_error: None,
         }
     }
 
@@ -43,6 +59,12 @@ impl Error {
     /// * On macOS this is the `IOReturn` value.
     pub fn os_error(&self) -> Option<u32> {
         self.code.map(|c| c.get())
+    }
+
+    /// Original browser rejection details, when this error came from WebUSB.
+    #[cfg(target_arch = "wasm32")]
+    pub fn webusb_error(&self) -> Option<&WebUsbError> {
+        self.webusb_error.as_ref()
     }
 }
 

@@ -88,18 +88,24 @@ fn rejection_field(value: &JsValue, field: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) fn rejection_details(value: &JsValue) -> crate::WebUsbError {
+    crate::WebUsbError {
+        name: rejection_field(value, "name").unwrap_or_else(|| "WebUsbError".into()),
+        message: rejection_field(value, "message")
+            .or_else(|| value.as_string())
+            .unwrap_or_else(|| format!("{value:?}")),
+        stack: rejection_field(value, "stack").unwrap_or_default(),
+    }
+}
+
 pub fn js_value_to_error(value: JsValue) -> Error {
-    // DOMException is not a JavaScript Error in every browser. Read the standard
-    // fields without assuming a constructor or retaining a thread-bound JsValue.
-    let name = rejection_field(&value, "name");
-    let message = rejection_field(&value, "message").or_else(|| value.as_string());
-    let detail = match (name, message) {
-        (Some(name), Some(message)) => format!("{name}: {message}"),
-        (Some(name), None) => name,
-        (None, Some(message)) => message,
-        (None, None) => format!("{value:?}"),
-    };
-    Error::new(ErrorKind::Other, format!("WebUSB error: {detail}")).log_debug()
+    let detail = rejection_details(&value);
+    let mut error = Error::new(
+        ErrorKind::Other,
+        format!("WebUSB error: {}: {}", detail.name, detail.message),
+    );
+    error.webusb_error = Some(detail);
+    error.log_debug()
 }
 
 pub fn js_value_to_transfer_error(value: JsValue) -> TransferError {
@@ -139,10 +145,18 @@ mod error_tests {
         ));
         assert_eq!(
             js_value_to_error(JsValue::from_str("permission denied")).to_string(),
-            "WebUSB error: permission denied"
+            "WebUSB error: WebUsbError: permission denied"
         );
         fn send_sync<T: Send + Sync>() {}
         send_sync::<Error>();
+        let rejection = js_sys::eval(
+            "({name:'SecurityError', message:'blocked', stack:'original browser stack'})"
+        ).unwrap();
+        let error = js_value_to_error(rejection);
+        let detail = error.webusb_error().unwrap();
+        assert_eq!(detail.name, "SecurityError");
+        assert_eq!(detail.message, "blocked");
+        assert_eq!(detail.stack, "original browser stack");
     }
 
     #[wasm_bindgen_test]
@@ -151,7 +165,7 @@ mod error_tests {
             js_sys::eval("({message:'retained', get name() {throw new Error('getter')}})").unwrap();
         assert_eq!(
             js_value_to_error(error).to_string(),
-            "WebUSB error: retained"
+            "WebUSB error: WebUsbError: retained"
         );
         assert!(js_value_to_error(JsValue::NULL)
             .to_string()
