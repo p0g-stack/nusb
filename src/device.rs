@@ -4,6 +4,7 @@ use crate::{
         DeviceDescriptor, InterfaceDescriptor, DESCRIPTOR_TYPE_STRING,
     },
     io::{EndpointRead, EndpointWrite},
+    maybe_future::{NonWasmSend, NonWasmSync},
     platform,
     transfer::{
         Buffer, BulkOrInterrupt, Completion, ControlIn, ControlOut, Direction, EndpointDirection,
@@ -21,6 +22,12 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
+#[cfg(target_arch = "wasm32")]
+use web_sys::UsbDevice;
+
+#[cfg(all(docsrs, not(target_arch = "wasm32")))]
+struct UsbDevice();
 
 /// An opened USB device.
 ///
@@ -52,7 +59,7 @@ impl Device {
     }
 
     pub(crate) fn open(d: &DeviceInfo) -> impl MaybeFuture<Output = Result<Device, Error>> {
-        platform::Device::from_device_info(d).map(|d| d.map(Device::wrap))
+        platform::Device::from_device_info(d).map_ok(Device::wrap)
     }
 
     /// Wrap a usbdevfs file descriptor that is already open.
@@ -64,17 +71,28 @@ impl Device {
     /// etc.
     ///
     /// *Supported on Linux and Android only.*
-    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg(any(docsrs, target_os = "android", target_os = "linux"))]
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> impl MaybeFuture<Output = Result<Device, Error>> {
-        platform::Device::from_fd(fd).map(|d| d.map(Device::wrap))
+        platform::Device::from_fd(fd).map_ok(Device::wrap)
     }
 
     /// Wrap a [`web_sys::UsbDevice`] object obtained from JS.
     ///
     /// *Supported on wasm only.*
+    #[cfg(any(docsrs, target_arch = "wasm32"))]
+    pub fn from_js(device: UsbDevice) -> impl MaybeFuture<Output = Result<Device, Error>> {
+        platform::Device::from_js(device).map_ok(Device::wrap)
+    }
+
+    /// Forcibly close the underlying WebUSB device, cancelling its transfers.
+    ///
+    /// Unlike dropping this handle, this also invalidates independently opened
+    /// handles backed by the same JS USBDevice. Only use when the caller owns
+    /// exclusive access to the entire device. Pending state-changing operations
+    /// are allowed to settle before the close is attempted.
     #[cfg(target_arch = "wasm32")]
-    pub fn from_js(device: web_sys::UsbDevice) -> impl MaybeFuture<Output = Result<Device, Error>> {
-        platform::Device::from_js(device).map(|d| d.map(Device::wrap))
+    pub fn force_close(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
+        self.backend.clone().force_close()
     }
 
     /// Open an interface of the device and claim it for exclusive use.
@@ -85,7 +103,7 @@ impl Device {
         self.backend
             .clone()
             .claim_interface(interface)
-            .map(|i| i.map(Interface::wrap))
+            .map_ok(Interface::wrap)
     }
 
     /// Detach kernel drivers and open an interface of the device and claim it for exclusive use.
@@ -100,7 +118,7 @@ impl Device {
         self.backend
             .clone()
             .detach_and_claim_interface(interface)
-            .map(|i| i.map(Interface::wrap))
+            .map_ok(Interface::wrap)
     }
 
     /// Detach kernel drivers for the specified interface.
@@ -186,7 +204,6 @@ impl Device {
     ///
     /// ### Platform-specific details
     ///
-    /// * On Windows, the timeout argument is ignored, and an OS-defined timeout is used.
     /// * On Windows, this does not wake suspended devices. Reading their
     ///   descriptors will return an error.
     pub fn get_descriptor(
@@ -201,8 +218,8 @@ impl Device {
             let _ = timeout;
             self.backend
                 .clone()
-                .get_descriptor(desc_type, desc_index, language_id)
-                .map(|r| r.map_err(GetDescriptorError::Transfer))
+                .get_descriptor(desc_type, desc_index, language_id, timeout)
+                .map_err(GetDescriptorError::Transfer)
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -221,7 +238,7 @@ impl Device {
                 },
                 timeout,
             )
-            .map(|r| r.map_err(GetDescriptorError::Transfer))
+            .map_err(GetDescriptorError::Transfer)
         }
     }
 
@@ -317,6 +334,7 @@ impl Device {
     /// * Not supported on Windows. You must [claim an interface][`Device::claim_interface`]
     ///   and use the interface handle to submit transfers.
     #[cfg(any(
+        docsrs,
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
@@ -359,6 +377,7 @@ impl Device {
     /// * Not supported on Windows. You must [claim an interface][`Device::claim_interface`]
     ///   and use the interface handle to submit transfers.
     #[cfg(any(
+        docsrs,
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
@@ -553,6 +572,19 @@ impl Interface {
             ep_type: PhantomData,
             ep_dir: PhantomData,
         })
+    }
+
+    /// Release the interface.
+    ///
+    /// Returns an error (`ErrorKind::Busy`) if any other reference to this
+    /// `Interface` still exists, including those from `Endpoint`s or their
+    /// pending transfers. Errors from disconnected devices are silently
+    /// ignored.
+    ///
+    /// This is the same as what occurs on `Drop` of the last clone of the
+    /// `Interface`, but allows it to be called asynchronously.
+    pub fn release(self) -> impl MaybeFuture<Output = Result<(), Error>> {
+        self.backend.release()
     }
 }
 
@@ -798,7 +830,9 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
     /// ## Panics
     /// * if there are no transfers pending (that is, if [`Self::pending()`]
     ///   would return 0).
-    pub fn next_complete(&mut self) -> impl Future<Output = Completion> + Send + Sync + '_ {
+    pub fn next_complete(
+        &mut self,
+    ) -> impl Future<Output = Completion> + NonWasmSend + NonWasmSync + '_ {
         poll_fn(|cx| self.poll_next_complete(cx))
     }
 
@@ -812,6 +846,17 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
     ///    would return 0).
     pub fn poll_next_complete(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
         self.backend.poll_next_complete(cx)
+    }
+
+    /// Take the original browser rejection for the most recently completed
+    /// transfer. Call immediately after `next_complete`/`poll_next_complete`
+    /// returns; the next completion replaces it, including on success.
+    ///
+    /// USB status failures (such as a stalled endpoint) and local validation
+    /// failures have no browser rejection and return `None`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn take_webusb_error(&mut self) -> Option<crate::WebUsbError> {
+        self.backend.take_webusb_error()
     }
 
     /// Wait for a pending transfer completion.
@@ -891,6 +936,7 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Debug for Endpoint<EpType,
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn assert_send_sync() {
     use crate::transfer::{Bulk, In, Interrupt, Out};
 

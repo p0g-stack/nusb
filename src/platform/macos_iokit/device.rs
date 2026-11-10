@@ -272,7 +272,7 @@ impl MacDevice {
         data: ControlIn,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let timeout = timeout.as_millis().try_into().expect("timeout too long");
+        let timeout = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
 
         let mut t = TransferData::new();
         t.put_buffer(Buffer::new(data.length as usize), Direction::In);
@@ -289,12 +289,13 @@ impl MacDevice {
             noDataTimeout: timeout,
         };
 
-        TransferFuture::new(t, |t| self.submit_control(Direction::In, t, req)).map(move |mut t| {
-            drop(self); // ensure device stays alive
-            let c = unsafe { t.take_completion(Direction::In) };
-            c.status?;
-            Ok(c.buffer.into_vec())
-        })
+        TransferFuture::new(self, t, |dev, t| dev.submit_control(Direction::In, t, req)).map(
+            |mut t| {
+                let c = unsafe { t.take_completion(Direction::In) };
+                c.status?;
+                Ok(c.buffer.into_vec())
+            },
+        )
     }
 
     pub fn control_out(
@@ -302,7 +303,7 @@ impl MacDevice {
         data: ControlOut,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let timeout = timeout.as_millis().try_into().expect("timeout too long");
+        let timeout = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
 
         let mut t = TransferData::new();
         t.put_buffer(Buffer::from(data.data), Direction::Out);
@@ -319,11 +320,12 @@ impl MacDevice {
             noDataTimeout: timeout,
         };
 
-        TransferFuture::new(t, |t| self.submit_control(Direction::Out, t, req)).map(move |mut t| {
-            drop(self); // ensure device stays alive
-            let c = unsafe { t.take_completion(Direction::Out) };
-            c.status
-        })
+        TransferFuture::new(self, t, |dev, t| dev.submit_control(Direction::Out, t, req)).map(
+            |mut t| {
+                let c = unsafe { t.take_completion(Direction::Out) };
+                c.status
+            },
+        )
     }
 
     fn submit_control(
@@ -472,6 +474,19 @@ impl MacInterface {
             max_packet_size,
             pending: VecDeque::new(),
             idle_transfer: None,
+        })
+    }
+
+    pub fn release(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
+        Blocking::new(move || {
+            if let Some(this) = Arc::into_inner(self) {
+                // USBInterfaceClose only fails on disconnected devices, but we'll ignore
+                // those errors to match the behavior of other platforms.
+                drop(this);
+                Ok(())
+            } else {
+                return Err(Error::new(ErrorKind::Busy, "interface is still in use"));
+            }
         })
     }
 }

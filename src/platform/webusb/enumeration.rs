@@ -1,7 +1,10 @@
 use wasm_bindgen_futures::JsFuture;
-use web_sys::UsbDevice;
+use web_sys::{UsbDevice, UsbDeviceFilter, UsbDeviceRequestOptions};
 
-use crate::{DeviceInfo, Error, InterfaceInfo, MaybeFuture};
+use crate::{
+    enumeration::{DeviceSelector, StringDescriptor},
+    DeviceInfo, Error, InterfaceInfo, MaybeFuture,
+};
 
 use super::{js_value_to_error, WebFuture};
 
@@ -29,9 +32,15 @@ pub(crate) fn device_to_info(device: UsbDevice) -> DeviceInfo {
         class: device.device_class(),
         subclass: device.device_subclass(),
         protocol: device.device_protocol(),
-        manufacturer_string: device.manufacturer_name(),
-        product_string: device.product_name(),
-        serial_number: device.serial_number(),
+        manufacturer_string: device
+            .manufacturer_name()
+            .map_or(StringDescriptor::NotPresent, StringDescriptor::Cached),
+        product_string: device
+            .product_name()
+            .map_or(StringDescriptor::NotPresent, StringDescriptor::Cached),
+        serial_number: device
+            .serial_number()
+            .map_or(StringDescriptor::NotPresent, StringDescriptor::Cached),
         interfaces: if let Some(config) = device.configuration() {
             config
                 .interfaces()
@@ -43,7 +52,9 @@ pub(crate) fn device_to_info(device: UsbDevice) -> DeviceInfo {
                         class: alt.interface_class(),
                         subclass: alt.interface_subclass(),
                         protocol: alt.interface_protocol(),
-                        interface_string: alt.interface_name(),
+                        interface_string: alt
+                            .interface_name()
+                            .map_or(StringDescriptor::NotPresent, StringDescriptor::Cached),
                     })
                 })
                 .collect()
@@ -52,4 +63,107 @@ pub(crate) fn device_to_info(device: UsbDevice) -> DeviceInfo {
         },
         device: device.clone(),
     }
+}
+
+pub fn request_device(
+    selectors: &[DeviceSelector],
+) -> impl MaybeFuture<Output = Result<Option<DeviceInfo>, Error>> + use<'_> {
+    let filters = selector_to_filters(selectors);
+    WebFuture(async move {
+        let usb = super::usb()?;
+        let device = if filters.is_empty() {
+            // WebUSB treats an empty filter list as matching all devices, but
+            // we'll go with the behavior of `.iter().any()` that makes more sense.
+            None
+        } else {
+            match JsFuture::from(usb.request_device(&UsbDeviceRequestOptions::new(&filters))).await {
+                Ok(device) => Some(device_to_info(device)),
+                Err(error) => return cancelled_or_error(error),
+            }
+        };
+
+        Ok(device)
+    })
+}
+
+// Only dismissal of the chooser is cancellation. Permission policy, transient
+// activation and browser permission failures must remain actionable errors.
+fn cancelled_or_error(
+    error: wasm_bindgen::JsValue,
+) -> Result<Option<DeviceInfo>, Error> {
+    if super::rejection_field(&error, "name").as_deref() == Some("NotFoundError") {
+        Ok(None)
+    } else {
+        Err(js_value_to_error(error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn only_not_found_is_cancellation() {
+        for name in ["NotFoundError", "SecurityError", "NotAllowedError", "InvalidStateError"] {
+            let error = web_sys::js_sys::Object::new();
+            web_sys::js_sys::Reflect::set(&error, &"name".into(), &name.into()).unwrap();
+            web_sys::js_sys::Reflect::set(
+                &error,
+                &"message".into(),
+                &"requestDevice requires transient activation".into(),
+            ).unwrap();
+            let result = cancelled_or_error(error.into());
+            if name == "NotFoundError" {
+                assert!(matches!(result, Ok(None)));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(name));
+                assert!(error.contains("requestDevice requires transient activation"));
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn unstructured_rejection_is_not_cancellation() {
+        assert!(cancelled_or_error("transient activation required".into()).is_err());
+        assert!(cancelled_or_error(wasm_bindgen::JsValue::UNDEFINED).is_err());
+    }
+}
+
+fn selector_to_filters(selectors: &[DeviceSelector]) -> Vec<UsbDeviceFilter> {
+    selectors
+        .iter()
+        .map(|rule| {
+            let filter = UsbDeviceFilter::new();
+            let DeviceSelector {
+                vendor_id,
+                product_id,
+                class,
+                subclass,
+                protocol,
+                ref serial_number,
+            } = *rule;
+
+            if let Some(vendor_id) = vendor_id {
+                filter.set_vendor_id(vendor_id);
+            }
+            if let Some(product_id) = product_id {
+                filter.set_product_id(product_id);
+            }
+            if let Some(class) = class {
+                filter.set_class_code(class);
+            }
+            if let Some(subclass) = subclass {
+                filter.set_subclass_code(subclass);
+            }
+            if let Some(protocol) = protocol {
+                filter.set_protocol_code(protocol);
+            }
+            if let Some(ref serial_number) = serial_number {
+                filter.set_serial_number(serial_number);
+            }
+            filter
+        })
+        .collect::<Vec<_>>()
 }

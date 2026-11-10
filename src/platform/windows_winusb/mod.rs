@@ -1,7 +1,7 @@
 mod enumeration;
 use std::num::NonZeroU32;
 
-pub use enumeration::{list_buses, list_devices};
+pub use enumeration::{list_buses, list_devices, StringDescriptorRef};
 
 mod device;
 pub(crate) use device::WindowsDevice as Device;
@@ -16,7 +16,10 @@ mod registry;
 pub(crate) use cfgmgr32::DevInst;
 use windows_sys::Win32::Foundation::WIN32_ERROR;
 pub(crate) use DevInst as DeviceId;
+
+#[cfg_attr(target_vendor = "win7", path = "hotplug_win7.rs")]
 mod hotplug;
+
 mod threadpool;
 mod util;
 pub(crate) use hotplug::WindowsHotplugWatch as HotplugWatch;
@@ -32,7 +35,7 @@ impl crate::error::Error {
         Self {
             kind,
             code: NonZeroU32::new(code as u32),
-            message,
+            message: message.into(),
         }
     }
 }

@@ -1,8 +1,9 @@
 mod device;
 mod enumeration;
 mod hotplug;
+mod lifecycle;
 
-pub use enumeration::list_devices;
+pub use enumeration::{list_devices, request_device};
 
 pub(crate) use device::WebusbDevice as Device;
 pub(crate) use device::WebusbEndpoint as Endpoint;
@@ -81,23 +82,98 @@ pub(crate) fn usb() -> Result<Usb, Error> {
     }
 }
 
+fn rejection_field(value: &JsValue, field: &str) -> Option<String> {
+    Reflect::get(value, &JsValue::from_str(field))
+        .ok()
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn rejection_details(value: &JsValue) -> crate::WebUsbError {
+    crate::WebUsbError {
+        name: rejection_field(value, "name").unwrap_or_else(|| "WebUsbError".into()),
+        message: rejection_field(value, "message")
+            .or_else(|| value.as_string())
+            .unwrap_or_else(|| format!("{value:?}")),
+        stack: rejection_field(value, "stack").unwrap_or_default(),
+    }
+}
+
 pub fn js_value_to_error(value: JsValue) -> Error {
-    let err: js_sys::Error = value
-        .dyn_into()
-        .unwrap_or_else(|_| js_sys::Error::new("error could not be constructed"));
-    let msg = err.message().as_string().unwrap_or_default();
-    log::warn!("WebUSB error: {msg}");
-    Error::new(ErrorKind::Other, "WebUSB error (see logs)")
+    let detail = rejection_details(&value);
+    let mut error = Error::new(
+        ErrorKind::Other,
+        format!("WebUSB error: {}: {}", detail.name, detail.message),
+    );
+    error.webusb_error = Some(detail);
+    error.log_debug()
 }
 
 pub fn js_value_to_transfer_error(value: JsValue) -> TransferError {
-    let err: js_sys::Error = value
-        .dyn_into()
-        .unwrap_or_else(|_| js_sys::Error::new("error could not be constructed"));
-    log::warn!("WebUSB transfer error: {:?}", err);
-    match err.name().as_string().as_deref() {
+    log::warn!(
+        "WebUSB transfer error: {}",
+        js_value_to_error(value.clone())
+    );
+    match rejection_field(&value, "name").as_deref() {
         Some("NetworkError") => TransferError::Disconnected,
         _ => TransferError::Fault,
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn preserves_error_dom_exception_and_string_rejections() {
+        let error = js_sys::Error::new("claim failed");
+        assert_eq!(
+            js_value_to_error(error.into()).to_string(),
+            "WebUSB error: Error: claim failed"
+        );
+        let exception =
+            js_sys::eval("new DOMException('device left while claiming', 'NetworkError')").unwrap();
+        let owned = js_value_to_error(exception.clone());
+        assert_eq!(
+            owned.to_string(),
+            "WebUSB error: NetworkError: device left while claiming"
+        );
+        assert_eq!(owned.clone().to_string(), owned.to_string());
+        assert!(matches!(
+            js_value_to_transfer_error(exception),
+            TransferError::Disconnected
+        ));
+        assert_eq!(
+            js_value_to_error(JsValue::from_str("permission denied")).to_string(),
+            "WebUSB error: WebUsbError: permission denied"
+        );
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Error>();
+        let rejection = js_sys::eval(
+            "({name:'SecurityError', message:'blocked', stack:'original browser stack'})"
+        ).unwrap();
+        let error = js_value_to_error(rejection);
+        let detail = error.webusb_error().unwrap();
+        assert_eq!(detail.name, "SecurityError");
+        assert_eq!(detail.message, "blocked");
+        assert_eq!(detail.stack, "original browser stack");
+    }
+
+    #[wasm_bindgen_test]
+    fn unusual_rejections_do_not_panic_or_erase_available_fields() {
+        let error =
+            js_sys::eval("({message:'retained', get name() {throw new Error('getter')}})").unwrap();
+        assert_eq!(
+            js_value_to_error(error).to_string(),
+            "WebUSB error: WebUsbError: retained"
+        );
+        assert!(js_value_to_error(JsValue::NULL)
+            .to_string()
+            .starts_with("WebUSB error:"));
+        assert!(js_value_to_error(JsValue::UNDEFINED)
+            .to_string()
+            .starts_with("WebUSB error:"));
     }
 }
 

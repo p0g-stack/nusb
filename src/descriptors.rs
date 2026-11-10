@@ -64,6 +64,12 @@ impl<'a> Descriptor<'a> {
     pub fn descriptor_type(&self) -> u8 {
         self.0[1]
     }
+
+    /// Get the bytes of this descriptor.
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
 }
 
 impl<'a> Deref for Descriptor<'a> {
@@ -128,7 +134,7 @@ impl<'a> DescriptorIter<'a> {
             let mut end = self.0[0] as usize;
 
             while self.0.len() >= end + 2
-                && self.0[end] > 2
+                && self.0[end] >= 2
                 && self.0[end + 1] != descriptor_type
                 && self.0.len() >= end + self.0[end] as usize
             {
@@ -736,7 +742,9 @@ pub(crate) fn decode_string_descriptor(data: &[u8]) -> Result<String, ()> {
 
 /// Make public when fuzzing
 #[cfg(fuzzing)]
-pub fn fuzz_parse_concatenated_config_descriptors(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub fn fuzz_parse_concatenated_config_descriptors(
+    buf: &[u8],
+) -> impl Iterator<Item = ConfigurationDescriptor<'_>> {
     parse_concatenated_config_descriptors(buf)
 }
 
@@ -820,6 +828,35 @@ fn test_empty_config() {
 fn test_malformed() {
     let c = ConfigurationDescriptor(&[9, 2, 0, 0, 0, 1, 0, 0, 2, 5, 250, 0, 0, 0]);
     assert!(c.interfaces().next().is_none());
+}
+
+#[test]
+#[rustfmt::skip]
+fn test_extra_descriptors() {
+    let c = ConfigurationDescriptor(&[
+        0x09, 0x02, 0x47, 0x00, 0x01, 0x01, 0x00, 0x80, 0xfa, // config
+        0x09, 0x04, 0x00, 0x00, 0x02, 0xff, 0x00, 0x00, 0x04, // interface
+        0x02, 0x30, // empty vendor descriptor
+        0x03, 0x30, 0xaa, // vendor descriptor
+        0x07, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00, // endpoint
+        0x02, 0x31, // empty vendor descriptor
+        0x07, 0x05, 0x83, 0x02, 0x40, 0x00, 0x00, // endpoint
+        0x03, 0x31, 0x55, // vendor descriptor
+    ]);
+
+    let interface = c.interface_alt_settings().next().unwrap();
+    assert_eq!(interface.interface_number(), 0);
+    assert_eq!(interface.descriptors().take(2).map(|d| d.as_bytes()).collect::<Vec<&[u8]>>(),
+        vec![&[0x02, 0x30][..], &[0x03, 0x30, 0xaa][..]]);
+
+    let mut endpoints = interface.endpoints();
+    let endpoint = endpoints.next().unwrap();
+    assert_eq!(endpoint.address(), 0x82);
+    assert_eq!(endpoint.descriptors().map(|d| d.as_bytes()).collect::<Vec<_>>(), vec![&[0x02, 0x31]]);
+
+    let endpoint = endpoints.next().unwrap();
+    assert_eq!(endpoint.address(), 0x83);
+    assert_eq!(endpoint.descriptors().map(|d| d.as_bytes()).collect::<Vec<_>>(), vec![&[0x03, 0x31, 0x55]]);
 }
 
 #[test]

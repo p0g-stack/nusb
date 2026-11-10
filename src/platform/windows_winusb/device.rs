@@ -54,7 +54,7 @@ use super::{
     },
     hub::HubPort,
     threadpool::Timer,
-    transfer::TransferData,
+    transfer::{transfer_error_from_win32, TransferData},
     util::{create_file, raw_handle, WCStr},
     DevInst,
 };
@@ -97,7 +97,7 @@ impl WindowsDevice {
             let config_descriptors = (0..num_configurations)
                 .flat_map(|i| {
                     let d = hub_port
-                        .get_descriptor(DESCRIPTOR_TYPE_CONFIGURATION, i, 0)
+                        .get_descriptor(DESCRIPTOR_TYPE_CONFIGURATION, i, 0, Duration::MAX)
                         .inspect_err(|e| error!("Failed to read config descriptor {}: {}", i, e))
                         .ok()?;
 
@@ -151,18 +151,21 @@ impl WindowsDevice {
         desc_type: u8,
         desc_index: u8,
         language_id: u16,
+        timeout: std::time::Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
         Blocking::new(move || {
             fn to_transfer_error(e: Error) -> TransferError {
-                match e.kind() {
-                    ErrorKind::Disconnected => TransferError::Disconnected,
-                    _ => TransferError::Unknown(e.os_error().unwrap_or(0)),
+                if e.kind() == ErrorKind::Disconnected {
+                    return TransferError::Disconnected;
                 }
+                e.os_error()
+                    .map(|code| transfer_error_from_win32(code).unwrap_err())
+                    .unwrap_or(TransferError::Unknown(0))
             }
 
             HubPort::by_child_devinst(self.devinst)
                 .map_err(to_transfer_error)?
-                .get_descriptor(desc_type, desc_index, language_id)
+                .get_descriptor(desc_type, desc_index, language_id, timeout)
                 .map_err(to_transfer_error)
         })
     }
@@ -300,13 +303,13 @@ impl WinusbFileHandle {
         let winusb_handle = unsafe {
             let mut h = ptr::null_mut();
             if WinUsb_Initialize(raw_handle(&handle), &mut h) == FALSE {
-                CloseThreadpoolIo(threadpool_io);
-                return Err(Error::new_os(
+                let err = Error::new_os(
                     ErrorKind::Other,
                     "failed to initialize WinUSB",
                     GetLastError(),
-                )
-                .log_debug());
+                );
+                CloseThreadpoolIo(threadpool_io);
+                return Err(err.log_debug());
             }
             h
         };
@@ -422,6 +425,7 @@ unsafe extern "system" fn io_callback(
 ) {
     let t = overlapped as *mut TransferData;
     {
+        // SAFETY: OS is done with the transfer, but we may be sharing access with `timer callback`
         let transfer = unsafe { &*t };
 
         debug!(
@@ -435,6 +439,12 @@ unsafe extern "system" fn io_callback(
             timer.cancel_and_wait();
         }
     }
+    {
+        // SAFETY: Timeout is cancelled so we now have exclusive access before `notify_completion`.
+        let transfer = unsafe { &mut *t };
+        transfer.error = transfer_error_from_win32(result);
+        transfer.actual_len = bytes_transferred as u32;
+    }
     unsafe { notify_completion::<TransferData>(t) }
 }
 
@@ -443,16 +453,16 @@ unsafe extern "system" fn timer_callback(
     context: *mut c_void,
     _timer: PTP_TIMER,
 ) {
-    let transfer_data = &*(context as *const TransferData);
+    let transfer = &*(context as *const TransferData);
     debug!(
         "Transfer {context:?} timeout on endpoint 0x{:02X}",
-        transfer_data.endpoint
+        transfer.endpoint
     );
 
     // Wait until the transfer has been submitted before trying to cancel it
-    let lock = transfer_data.intf.timeout_mutex.lock().unwrap();
+    let lock = transfer.intf.timeout_mutex.lock().unwrap();
     unsafe {
-        CancelIoEx(transfer_data.intf.handle, &transfer_data.overlapped);
+        CancelIoEx(transfer.intf.handle, transfer.overlapped.get());
     }
     drop(lock);
 }
@@ -523,7 +533,7 @@ impl Drop for WindowsInterface {
 
 impl WindowsInterface {
     pub fn control_in(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         data: ControlIn,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
@@ -538,17 +548,15 @@ impl WindowsInterface {
             Length: data.length,
         };
 
-        let intf = self.clone();
-
-        TransferFuture::new(t, |t| self.submit_control(t, pkt, timeout)).map(move |mut t| {
-            let c = t.take_completion(&intf);
+        TransferFuture::new(self, t, |intf, t| intf.submit_control(t, pkt, timeout)).map(|mut t| {
+            let c = t.take_completion();
             c.status?;
             Ok(c.buffer.into_vec())
         })
     }
 
     pub fn control_out(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         data: ControlOut,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
@@ -563,10 +571,8 @@ impl WindowsInterface {
             Length: data.data.len().try_into().expect("transfer too large"),
         };
 
-        let intf = self.clone();
-
-        TransferFuture::new(t, |t| self.submit_control(t, pkt, timeout)).map(move |mut t| {
-            let c = t.take_completion(&intf);
+        TransferFuture::new(self, t, |intf, t| intf.submit_control(t, pkt, timeout)).map(|mut t| {
+            let c = t.take_completion();
             c.status
         })
     }
@@ -655,10 +661,9 @@ impl WindowsInterface {
     fn submit(&self, mut t: Idle<TransferData>) -> Pending<TransferData> {
         let endpoint = t.endpoint;
         let dir = Direction::from_address(endpoint);
-        let len = t.request_len;
+        let len = t.requested_len;
         let buf = t.buf;
         t.overlapped = unsafe { mem::zeroed() };
-        t.error_from_submit = Ok(());
 
         let t = t.pre_submit();
         let ptr = t.as_ptr();
@@ -701,16 +706,15 @@ impl WindowsInterface {
     ) -> Pending<TransferData> {
         let endpoint = t.endpoint;
         let dir = Direction::from_address(endpoint);
-        let len = t.request_len;
+        let len = t.requested_len;
         let buf = t.buf;
         t.overlapped = unsafe { mem::zeroed() };
-        t.error_from_submit = Ok(());
 
         if pkt.RequestType & 0x1f == Recipient::Interface as u8
             && pkt.Index as u8 != self.interface_number
         {
             warn!("WinUSB requires control transfer with `Recipient::Interface` to pass the interface number in `index`");
-            t.error_from_submit = Err(TransferError::InvalidArgument);
+            t.error = Err(TransferError::InvalidArgument);
             return t.simulate_complete();
         }
 
@@ -760,7 +764,8 @@ impl WindowsInterface {
 
     fn post_submit(&self, r: i32, t: Pending<TransferData>) -> Pending<TransferData> {
         if r == TRUE {
-            error!("Transfer submit completed synchronously")
+            warn!("Transfer submit completed synchronously");
+            return t;
         }
 
         let err = unsafe { GetLastError() };
@@ -778,7 +783,7 @@ impl WindowsInterface {
                 if let Some(ref timer) = (*t.as_ptr()).timeout {
                     timer.cancel_and_wait();
                 }
-                (*t.as_ptr()).error_from_submit = match err {
+                (*t.as_ptr()).error = match err {
                     ERROR_BAD_COMMAND
                     | ERROR_FILE_NOT_FOUND
                     | ERROR_DEVICE_NOT_CONNECTED
@@ -806,6 +811,18 @@ impl WindowsInterface {
                 }
             }
         }
+    }
+
+    pub fn release(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
+        Blocking::new(move || {
+            if let Some(this) = Arc::into_inner(self) {
+                // WinUSB_Free is infallible, so just drop from the the threadpool.
+                drop(this);
+                Ok(())
+            } else {
+                return Err(Error::new(ErrorKind::Busy, "interface is still in use"));
+            }
+        })
     }
 }
 
@@ -862,14 +879,14 @@ impl WindowsEndpoint {
 
     pub(crate) fn submit_err(&mut self, buffer: Buffer, err: TransferError) {
         let mut t = self.make_transfer(buffer);
-        t.error_from_submit = Err(err);
+        t.error = Err(err);
         self.pending.push_back(t.simulate_complete());
     }
 
     pub(crate) fn poll_next_complete(&mut self, cx: &mut Context) -> Poll<Completion> {
         self.inner.notify.subscribe(cx);
         if let Some(mut transfer) = take_completed_from_queue(&mut self.pending) {
-            let completion = transfer.take_completion(&self.inner.interface);
+            let completion = transfer.take_completion();
             self.idle_transfer = Some(transfer);
             Poll::Ready(completion)
         } else {
@@ -880,7 +897,7 @@ impl WindowsEndpoint {
     pub(crate) fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
         self.inner.notify.wait_timeout(timeout, || {
             take_completed_from_queue(&mut self.pending).map(|mut transfer| {
-                let completion = transfer.take_completion(&self.inner.interface);
+                let completion = transfer.take_completion();
                 self.idle_transfer = Some(transfer);
                 completion
             })

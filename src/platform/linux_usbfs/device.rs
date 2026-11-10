@@ -382,8 +382,7 @@ impl LinuxDevice {
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
         let t = TransferData::new_control_in(data);
-        TransferFuture::new(t, |t| self.submit_timeout(t, timeout)).map(move |t| {
-            drop(self); // ensure device stays alive
+        TransferFuture::new(self, t, |device, t| device.submit_timeout(t, timeout)).map(|t| {
             t.status()?;
             Ok(t.control_in_data().to_owned())
         })
@@ -395,8 +394,7 @@ impl LinuxDevice {
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
         let t = TransferData::new_control_out(data);
-        TransferFuture::new(t, |t| self.submit_timeout(t, timeout)).map(move |t| {
-            drop(self); // ensure device stays alive
+        TransferFuture::new(self, t, |device, t| device.submit_timeout(t, timeout)).map(|t| {
             t.status()?;
             Ok(())
         })
@@ -509,8 +507,11 @@ impl LinuxDevice {
         timeout: Duration,
     ) -> Pending<TransferData> {
         let urb = transfer.urb_ptr();
+
+        // Clamp timeout to prevent overflow panic.
+        // Arbitrary value larger than any desirable timeout since there is no `saturating_add` or `Instant::MAX`.
         let now = Instant::now();
-        let deadline = now + timeout;
+        let deadline = now + timeout.min(Duration::from_secs(24 * 60 * 60));
         transfer.deadline = Some(deadline);
 
         // Hold the lock across `submit`, so that it can't complete before we
@@ -717,6 +718,18 @@ impl LinuxInterface {
             max_packet_size,
             pending: VecDeque::new(),
             idle_transfer: None,
+        })
+    }
+
+    pub fn release(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
+        Blocking::new(move || {
+            if let Some(this) = Arc::into_inner(self) {
+                // USBDEVFS_RELEASEINTERFACE only fails on invalid argument, so no need to get a result out of drop.
+                drop(this);
+                Ok(())
+            } else {
+                return Err(Error::new(ErrorKind::Busy, "interface is still in use"));
+            }
         })
     }
 }

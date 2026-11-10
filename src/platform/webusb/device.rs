@@ -9,7 +9,7 @@ use std::{
 };
 
 use wasm_bindgen_futures::{
-    js_sys::{Promise, Reflect},
+    js_sys::Promise,
     spawn_local,
     wasm_bindgen::{JsCast, JsValue},
     JsFuture,
@@ -60,6 +60,7 @@ pub(crate) struct WebusbDevice {
     pub device: UsbDevice,
     device_descriptor: DeviceDescriptor,
     config_descriptors: Vec<Vec<u8>>,
+    lease: super::lifecycle::OpenLease,
 }
 
 impl WebusbDevice {
@@ -73,53 +74,20 @@ impl WebusbDevice {
         device: UsbDevice,
     ) -> impl MaybeFuture<Output = Result<Arc<WebusbDevice>, Error>> {
         WebFuture(async move {
-            JsFuture::from(device.open())
-                .await
-                .map_err(js_value_to_error)?;
-
-            inc_open_count(&device);
-
-            // Any error past this point must balance the open() above.
-            let built = async {
-                let device_descriptor = get_descriptor(
-                    &device,
-                    DESCRIPTOR_TYPE_DEVICE,
-                    0,
-                    0,
-                    Duration::from_millis(500),
-                )
-                .await?;
-
-                let device_descriptor = match DeviceDescriptor::new(&device_descriptor)
-                    .ok_or_else(|| Error::new(ErrorKind::Other, "invalid device descriptor"))
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        dec_and_maybe_close(&device);
-                        return Err(e);
-                    }
-                };
-
-                let config_descriptors = extract_descriptors(&device).await?;
-                Ok::<_, Error>((device_descriptor, config_descriptors))
-            }
-            .await;
-
-            match built {
-                Ok((device_descriptor, config_descriptors)) =>
-                {
-                    #[allow(clippy::arc_with_non_send_sync)]
-                    Ok(Arc::new(Self {
-                        device,
-                        device_descriptor,
-                        config_descriptors,
-                    }))
-                }
-                Err(e) => {
-                    dec_and_maybe_close(&device);
-                    Err(e)
-                }
-            }
+            let lease = super::lifecycle::OpenLease::acquire(device.clone())?;
+            JsFuture::from(lease.ready()).await.map_err(js_value_to_error)?;
+            let device_descriptor =
+                get_descriptor(&device, DESCRIPTOR_TYPE_DEVICE, 0, 0, 18).await?;
+            let device_descriptor = DeviceDescriptor::new(&device_descriptor)
+                .ok_or_else(|| Error::new(ErrorKind::Other, "invalid device descriptor"))?;
+            let config_descriptors = extract_descriptors(&device).await?;
+            #[allow(clippy::arc_with_non_send_sync)]
+            Ok(Arc::new(Self {
+                device,
+                device_descriptor,
+                config_descriptors,
+                lease,
+            }))
         })
     }
 
@@ -146,12 +114,19 @@ impl WebusbDevice {
             .unwrap_or_default()
     }
 
+    pub(crate) fn force_close(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
+        WebFuture(async move {
+            JsFuture::from(self.lease.force_close()).await.map_err(js_value_to_error).map(|_| ())
+        })
+    }
+
     pub(crate) fn set_configuration(
         self: Arc<Self>,
         configuration: u8,
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
         WebFuture(async move {
-            JsFuture::from(self.device.select_configuration(configuration))
+            let device = self.device.clone();
+            JsFuture::from(self.lease.change(move || device.select_configuration(configuration).into()))
                 .await
                 .map_err(js_value_to_error)
                 .map(|_| ())
@@ -160,7 +135,8 @@ impl WebusbDevice {
 
     pub(crate) fn reset(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
         WebFuture(async move {
-            JsFuture::from(self.device.reset())
+            let device = self.device.clone();
+            JsFuture::from(self.lease.change(move || device.reset().into()))
                 .await
                 .map_err(js_value_to_error)
                 .map(|_| ())
@@ -188,7 +164,8 @@ impl WebusbDevice {
                 return Err(Error::new(ErrorKind::Busy, "interface already claimed"));
             }
 
-            JsFuture::from(self.device.claim_interface(interface_number))
+            let device = self.device.clone();
+            JsFuture::from(self.lease.change(move || device.claim_interface(interface_number).into()))
                 .await
                 .map_err(js_value_to_error)?;
 
@@ -199,6 +176,7 @@ impl WebusbDevice {
                     endpoints_used: Default::default(),
                 })),
                 interface_number,
+                released: false,
                 device: self.clone(),
             }))
         })
@@ -247,11 +225,13 @@ impl WebusbDevice {
             control.control_type.into(),
             control.value,
         );
-        let mut data = control.data.to_vec();
+        // `controlTransferOut` won't accept a view of a `SharedArrayBuffer` linear memory,
+        // so expliclity copy to a non-shared `Uint8Array`.
+        let data = Uint8Array::from(control.data);
         WebFuture(async move {
             let res = JsFuture::from(
                 self.device
-                    .control_transfer_out_with_u8_slice(&setup, &mut data)
+                    .control_transfer_out_with_u8_array(&setup, &data)
                     .map_err(js_value_to_transfer_error)?,
             )
             .await
@@ -259,56 +239,6 @@ impl WebusbDevice {
             let res: UsbOutTransferResult = JsCast::unchecked_from_js(res.into());
             webusb_status_to_nusb_transfer_error(res.status())
         })
-    }
-}
-
-/// Property key for the open count we stash on the JS `USBDevice`.
-const OPEN_COUNT_KEY: &str = "__nusb_open_count";
-
-fn open_count(device: &UsbDevice) -> f64 {
-    Reflect::get(device.as_ref(), &JsValue::from_str(OPEN_COUNT_KEY))
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-}
-
-fn inc_open_count(device: &UsbDevice) {
-    let n = open_count(device) + 1.0;
-    let _ = Reflect::set(
-        device.as_ref(),
-        &JsValue::from_str(OPEN_COUNT_KEY),
-        &JsValue::from_f64(n),
-    );
-    log::debug!("nusb webusb: open count -> {n}");
-}
-
-/// Drop one open reference; close the JS device if it was the last.
-fn dec_and_maybe_close(device: &UsbDevice) {
-    let n = open_count(device) - 1.0;
-    let _ = Reflect::set(
-        device.as_ref(),
-        &JsValue::from_str(OPEN_COUNT_KEY),
-        &JsValue::from_f64(n),
-    );
-    log::debug!("nusb webusb: open count -> {n}");
-    if n <= 0.0 {
-        log::debug!("nusb webusb: last handle dropped, closing device");
-        let promise = device.close();
-        spawn_local(async move {
-            let _ = JsFuture::from(promise).await;
-        });
-    }
-}
-
-impl Drop for WebusbDevice {
-    fn drop(&mut self) {
-        dec_and_maybe_close(&self.device);
-    }
-}
-
-impl Drop for WebusbInterface {
-    fn drop(&mut self) {
-        let _ = self.device.device.release_interface(self.interface_number);
     }
 }
 
@@ -320,14 +250,18 @@ async fn extract_descriptors(device: &UsbDevice) -> Result<Vec<Vec<u8>>, Error> 
         let language_id = 0;
         let desc_type = DESCRIPTOR_TYPE_CONFIGURATION;
         let desc_index = i as u8;
-        let data = get_descriptor(
-            device,
-            desc_type,
-            desc_index,
-            language_id,
-            Duration::from_millis(500),
-        )
-        .await?;
+
+        // Initial read to get just the configuration descriptor with `wTotalLength`
+        let data = get_descriptor(device, desc_type, desc_index, language_id, 9).await?;
+
+        let total_len = if let Some(total_len) = data.get(2..4) {
+            u16::from_le_bytes(total_len.try_into().unwrap())
+        } else {
+            continue;
+        };
+
+        // Read the full set of descriptors
+        let data = get_descriptor(device, desc_type, desc_index, language_id, total_len).await?;
 
         if ConfigurationDescriptor::new(&data[..]).is_some() {
             config_descriptors.push(data)
@@ -337,12 +271,12 @@ async fn extract_descriptors(device: &UsbDevice) -> Result<Vec<Vec<u8>>, Error> 
     Ok(config_descriptors)
 }
 
-pub async fn get_descriptor(
+async fn get_descriptor(
     device: &UsbDevice,
     desc_type: u8,
     desc_index: u8,
     language_id: u16,
-    _timeout: Duration,
+    length: u16,
 ) -> Result<Vec<u8>, Error> {
     let setup = UsbControlTransferParameters::new(
         language_id,
@@ -351,7 +285,7 @@ pub async fn get_descriptor(
         web_sys::UsbRequestType::Standard,
         ((desc_type as u16) << 8) | (desc_index as u16),
     );
-    let res = wasm_bindgen_futures::JsFuture::from(device.control_transfer_in(&setup, 4096))
+    let res = JsFuture::from(device.control_transfer_in(&setup, length))
         .await
         .map_err(js_value_to_error)?;
     let res: UsbInTransferResult = JsCast::unchecked_from_js(res.into());
@@ -363,6 +297,7 @@ pub async fn get_descriptor(
 
 pub(crate) struct WebusbInterface {
     pub interface_number: u8,
+    released: bool,
     pub(crate) device: Arc<WebusbDevice>,
     state: Arc<Mutex<InterfaceState>>,
 }
@@ -389,11 +324,11 @@ impl WebusbInterface {
                 }
             }
 
-            JsFuture::from(
-                self.device
-                    .device
-                    .select_alternate_interface(self.interface_number, alternate_setting),
-            )
+            let device = self.device.device.clone();
+            let interface_number = self.interface_number;
+            JsFuture::from(self.device.lease.change(move || {
+                device.select_alternate_interface(interface_number, alternate_setting).into()
+            }))
             .await
             .map_err(js_value_to_error)
             .map(|_| ())?;
@@ -447,7 +382,35 @@ impl WebusbInterface {
             }),
             max_packet_size,
             pending: VecDeque::new(),
+            last_webusb_error: None,
         })
+    }
+
+    pub fn release(self: Arc<Self>) -> impl MaybeFuture<Output = Result<(), Error>> {
+        WebFuture(async move {
+            if let Some(mut this) = Arc::into_inner(self) {
+                this.released = true;
+                let device = this.device.device.clone();
+                let interface_number = this.interface_number;
+                JsFuture::from(this.device.lease.change(move || device.release_interface(interface_number).into()))
+                    .await
+                    .map_err(js_value_to_error)?;
+                Ok(())
+            } else {
+                return Err(Error::new(ErrorKind::Busy, "interface is still in use"));
+            }
+        })
+    }
+}
+
+impl Drop for WebusbInterface {
+    fn drop(&mut self) {
+        if !self.released {
+            let device = self.device.device.clone();
+            let interface_number = self.interface_number;
+            let promise = self.device.lease.change(move || device.release_interface(interface_number).into());
+            spawn_local(async move { let _ = JsFuture::from(promise).await; });
+        }
     }
 }
 
@@ -468,20 +431,9 @@ enum Pending {
     Failed {
         buffer: Buffer,
         error: TransferError,
+        detail: Option<crate::WebUsbError>,
     },
 }
-
-// `JsFuture` contains an `Rc<RefCell<...>>`, so it is neither `Send` nor
-// `Sync`. The cross-platform `Endpoint` API requires its backend to be both
-// (so users can pass endpoints into Send-bounded async runtimes, the same
-// reason `wasm-bindgen` itself unsafe-impls `Send`/`Sync` for `JsValue`).
-// wasm32 is single-threaded by default, and even with the threads proposal
-// JS objects can't transit between worker contexts, so this is sound in
-// practice.
-#[cfg(not(target_feature = "atomics"))]
-unsafe impl Send for Pending {}
-#[cfg(not(target_feature = "atomics"))]
-unsafe impl Sync for Pending {}
 
 pub(crate) struct WebusbEndpoint {
     inner: Arc<EndpointInner>,
@@ -490,6 +442,9 @@ pub(crate) struct WebusbEndpoint {
 
     /// A queue of pending transfers, expected to complete in order.
     pending: VecDeque<Pending>,
+    // Replaced at every completion, so queued transfers cannot return stale
+    // evidence. Kept off TransferError to preserve its Copy contract.
+    last_webusb_error: Option<crate::WebUsbError>,
 }
 
 struct EndpointInner {
@@ -511,7 +466,7 @@ impl WebusbEndpoint {
     /// Used by the public `Endpoint::submit` to surface validation errors
     /// through the same completion queue as real transfers.
     pub(crate) fn submit_err(&mut self, buffer: Buffer, error: TransferError) {
-        self.pending.push_back(Pending::Failed { buffer, error });
+        self.pending.push_back(Pending::Failed { buffer, error, detail: None });
     }
 
     pub(crate) fn submit(&mut self, buffer: Buffer) {
@@ -534,7 +489,8 @@ impl WebusbEndpoint {
                         );
                         self.pending.push_back(Pending::Failed {
                             buffer,
-                            error: TransferError::Fault,
+                            error: js_value_to_transfer_error(e.clone()),
+                            detail: Some(super::rejection_details(&e)),
                         });
                         return;
                     }
@@ -560,9 +516,10 @@ impl WebusbEndpoint {
 
         match head {
             Pending::Failed { .. } => {
-                let Some(Pending::Failed { buffer, error }) = self.pending.pop_front() else {
+                let Some(Pending::Failed { buffer, error, detail }) = self.pending.pop_front() else {
                     unreachable!()
                 };
+                self.last_webusb_error = detail;
                 Poll::Ready(Completion {
                     buffer,
                     actual_len: 0,
@@ -571,6 +528,7 @@ impl WebusbEndpoint {
             }
             Pending::InFlight { future, .. } => {
                 let result = ready!(Pin::new(future).poll(cx));
+                self.last_webusb_error = result.as_ref().err().map(super::rejection_details);
                 let Some(Pending::InFlight {
                     buffer, direction, ..
                 }) = self.pending.pop_front()
@@ -580,6 +538,10 @@ impl WebusbEndpoint {
                 Poll::Ready(complete_transfer(buffer, direction, result))
             }
         }
+    }
+
+    pub(crate) fn take_webusb_error(&mut self) -> Option<crate::WebUsbError> {
+        self.last_webusb_error.take()
     }
 
     pub(crate) fn clear_halt(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
@@ -663,5 +625,75 @@ impl Drop for EndpointInner {
     fn drop(&mut self) {
         let mut state = self.interface.state.lock().unwrap();
         state.endpoints_used.clear(self.address);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn endpoint(script: &str) -> WebusbEndpoint {
+        let device: UsbDevice = js_sys::eval(script).unwrap().unchecked_into();
+        js_sys::Reflect::set(&device, &"opened".into(), &JsValue::TRUE).unwrap();
+        js_sys::Reflect::set(
+            &device, &"close".into(),
+            &js_sys::eval("(function() { this.opened = false; return Promise.resolve(); })").unwrap(),
+        ).unwrap();
+        let descriptor = [18, 1, 0, 2, 0, 0, 0, 64, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let device = Arc::new(WebusbDevice {
+            device: device.clone(),
+            device_descriptor: DeviceDescriptor::new(&descriptor).unwrap(),
+            config_descriptors: vec![],
+            lease: super::super::lifecycle::OpenLease::acquire(device.clone()).unwrap(),
+        });
+        let interface = Arc::new(WebusbInterface {
+            interface_number: 0,
+            released: true,
+            device,
+            state: Arc::new(Mutex::new(InterfaceState::default())),
+        });
+        WebusbEndpoint {
+            inner: Arc::new(EndpointInner { address: 1, interface }),
+            max_packet_size: 64,
+            pending: VecDeque::new(),
+            last_webusb_error: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn completion_retains_rejection_and_clears_it_on_next_completion() {
+        let mut endpoint = endpoint(r#"({
+            fail: true,
+            transferOut(_endpoint, data) {
+                if (this.fail) {
+                    this.fail = false;
+                    return Promise.reject({name:'SecurityError',message:'denied',stack:'original'});
+                }
+                return Promise.resolve({status:'ok',bytesWritten:data.byteLength});
+            }
+        })"#);
+        endpoint.submit(Buffer::from(vec![1]));
+        let result = std::future::poll_fn(|cx| endpoint.poll_next_complete(cx)).await;
+        assert!(result.status.is_err());
+        let detail = endpoint.take_webusb_error().unwrap();
+        assert_eq!((detail.name.as_str(), detail.message.as_str(), detail.stack.as_str()),
+            ("SecurityError", "denied", "original"));
+        assert!(endpoint.take_webusb_error().is_none());
+        endpoint.submit(Buffer::from(vec![2]));
+        let result = std::future::poll_fn(|cx| endpoint.poll_next_complete(cx)).await;
+        assert!(result.status.is_ok());
+        assert!(endpoint.take_webusb_error().is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn synchronous_submission_rejection_preserves_details() {
+        let mut endpoint = endpoint(r#"({
+            transferOut() { throw {name:'DataError',message:'too large',stack:'submit stack'}; }
+        })"#);
+        endpoint.submit(Buffer::from(vec![1]));
+        let result = std::future::poll_fn(|cx| endpoint.poll_next_complete(cx)).await;
+        assert!(result.status.is_err());
+        assert_eq!(endpoint.take_webusb_error().unwrap().stack, "submit stack");
     }
 }
